@@ -1,3 +1,4 @@
+import { Suspense } from 'react';
 import { notFound } from 'next/navigation';
 import { createClient } from '@/lib/supabase/server';
 import { LoopPlayer } from '@/components/loop-player';
@@ -5,7 +6,22 @@ import { SiteHeader } from '@/components/site-header';
 import { CopyToEditorButton } from '@/components/copy-to-editor-button';
 import { LikeButton } from '@/components/like-button';
 
-export default async function LoopPage({ params }: { params: Promise<{ id: string }> }) {
+// Coquille statique : params et cookies sont lus dans <Suspense>
+export default function LoopPage({ params }: { params: Promise<{ id: string }> }) {
+  return (
+    <Suspense
+      fallback={
+        <>
+          <div className="h-14 border-b" />
+          <p className="p-4 text-sm text-muted-foreground">Chargement…</p>
+        </>
+      }>
+      <LoopContent params={params} />
+    </Suspense>
+  );
+}
+
+async function LoopContent({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   const supabase = await createClient();
   const {
