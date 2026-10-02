@@ -54,6 +54,7 @@ const btnSm = 'rounded border px-1.5 py-0.5 text-xs hover:bg-accent';
 // Boutons de la manette (mapping "standard") -> action
 const PAD_MAP: Record<number, string> = {
   0: 'play', // A / croix
+  1: 'record', // B / rond
   2: 'restart', // X / carré
   3: 'mark', // Y / triangle
   4: 'prev', // LB / L1
@@ -62,6 +63,22 @@ const PAD_MAP: Record<number, string> = {
   14: 'prev', // croix gauche
   15: 'next', // croix droite
 };
+
+type Phase = 'idle' | 'countdown' | 'armed' | 'recording';
+type Recording = { blob: Blob; url: string; mime: string; w: number; h: number };
+
+function pickMime(): string | undefined {
+  if (typeof MediaRecorder === 'undefined') return undefined;
+  return ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4'].find((t) =>
+    MediaRecorder.isTypeSupported(t)
+  );
+}
+
+// Temps de capture conservé après la fin du segment : le danseur a un temps de réaction,
+// son dernier mouvement se termine après la dernière image de la vidéo.
+const CAPTURE_TAIL_MS = 0;
+
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
 // Une borne de segment (début ou fin), avec ses boutons ±0,5 s si elle est modifiable
 function Edge({
@@ -129,6 +146,21 @@ export function LoopPlayer({
   const [padName, setPadName] = useState<string | null>(null);
   const [padStandard, setPadStandard] = useState(true);
 
+  // Caméra / captures
+  const [cameraOn, setCameraOn] = useState(false);
+  const [phase, setPhaseState] = useState<Phase>('idle');
+  const [count, setCount] = useState<string | null>(null);
+  const [recordings, setRecordings] = useState<Record<number, Recording>>({});
+  const [viewLive, setViewLive] = useState(false);
+  const [altShow, setAltShow] = useState(false);
+  const [loopTick, setLoopTick] = useState(0);
+  const [exporting, setExporting] = useState<{ i: number; n: number } | null>(null);
+  const [isMobile, setIsMobile] = useState(false);
+  const [portrait, setPortrait] = useState(false);
+  const [cover, setCover] = useState(true);
+  const [pos, setPos] = useState({ x: 0, y: 80 });
+  const [size, setSize] = useState({ w: 320, h: 200 });
+
   const rootRef = useRef<HTMLDivElement>(null);
   const holderRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<any>(null);
@@ -137,6 +169,23 @@ export function LoopPlayer({
   const rowRefs = useRef<(HTMLLIElement | null)[]>([]);
   const firstScroll = useRef(true);
   const actions = useRef<Record<string, () => void>>({});
+  const streamRef = useRef<MediaStream | null>(null);
+  const handleRef = useRef<{ rec: MediaRecorder; discard: boolean } | null>(null);
+  const phaseRef = useRef<Phase>('idle');
+  const timersRef = useRef<number[]>([]);
+  const recSegRef = useRef(0);
+  const recordingsRef = useRef<Record<number, Recording>>({});
+  const liveRef = useRef<HTMLVideoElement>(null);
+  const replayRef = useRef<HTMLVideoElement>(null);
+  const floatRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ dx: number; dy: number } | null>(null);
+  const resizeRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
+  const lastLoopRef = useRef(0);
+  const triggerLoopRef = useRef<(p: any) => void>(() => {});
+  const trainingRef = useRef(false);
+  const loopHook = useRef<() => void>(() => {});
+  const armedHook = useRef<() => void>(() => {});
+  trainingRef.current = training;
 
   // Bornes du segment courant, lues par la boucle de surveillance
   const points = [0, ...marks, duration];
@@ -172,10 +221,18 @@ export function LoopPlayer({
           onReady: (e: any) => setDuration(e.target.getDuration() || 0),
           onStateChange: (e: any) => {
             setPlaying(e.data === YT.PlayerState.PLAYING);
+            // La lecture démarre après le compte à rebours : on lance l'enregistrement
+            if (e.data === YT.PlayerState.PLAYING && phaseRef.current === 'armed') {
+              armedHook.current();
+            }
             // Fin de vidéo dans le dernier segment : on reboucle
             const b = bounds.current;
-            if (e.data === YT.PlayerState.ENDED && b.looping && b.hasMarks) {
-              e.target.seekTo(b.start, true);
+            if (
+              e.data === YT.PlayerState.ENDED &&
+              (b.looping || phaseRef.current === 'recording') &&
+              b.hasMarks
+            ) {
+              triggerLoopRef.current(e.target);
               e.target.playVideo();
             }
           },
@@ -201,13 +258,21 @@ export function LoopPlayer({
         const d = p.getDuration?.();
         if (d) setDuration(d);
       }
-      const b = bounds.current;
-      if (b.looping && b.hasMarks && b.end > 0 && t >= b.end - 0.05) {
-        p.seekTo(b.start, true);
-      }
     }, 100);
     return () => clearInterval(id);
   }, [duration]);
+
+  // Détection de la fin de segment, plus fréquente pour que la boucle (et la capture) soit précise
+  useEffect(() => {
+    const id = setInterval(() => {
+      const p = playerRef.current;
+      if (!p?.getCurrentTime) return;
+      const b = bounds.current;
+      if (!((b.looping || phaseRef.current === 'recording') && b.hasMarks && b.end > 0)) return;
+      if (p.getCurrentTime() >= b.end - 0.03) triggerLoopRef.current(p);
+    }, 25);
+    return () => clearInterval(id);
+  }, []);
 
   // Manette : détection des appuis sur les boutons
   useEffect(() => {
@@ -241,7 +306,16 @@ export function LoopPlayer({
     };
     window.addEventListener('keydown', onKey);
     document.addEventListener('fullscreenchange', onFs);
+    // Empêche la mise en veille de l'écran pendant l'entraînement
+    let lock: any = null;
+    (navigator as any).wakeLock
+      ?.request('screen')
+      .then((l: any) => {
+        lock = l;
+      })
+      .catch(() => {});
     return () => {
+      lock?.release?.();
       document.body.style.overflow = prevOverflow;
       window.removeEventListener('keydown', onKey);
       document.removeEventListener('fullscreenchange', onFs);
@@ -257,6 +331,78 @@ export function LoopPlayer({
     setBarH(el.offsetHeight);
     return () => ro.disconnect();
   }, [training]);
+
+  // Détection mobile (pointeur tactile) et orientation
+  useEffect(() => {
+    const coarse = window.matchMedia('(pointer: coarse)');
+    const port = window.matchMedia('(orientation: portrait)');
+    const update = () => {
+      setIsMobile(coarse.matches);
+      setPortrait(port.matches);
+    };
+    update();
+    coarse.addEventListener('change', update);
+    port.addEventListener('change', update);
+    return () => {
+      coarse.removeEventListener('change', update);
+      port.removeEventListener('change', update);
+    };
+  }, []);
+
+  // Caméra coupée dès qu'on quitte l'entraînement
+  useEffect(() => {
+    if (!training) stopCamera();
+  }, [training]);
+
+  // Les captures dépendent des segments : si les timecodes changent, on repart de zéro
+  useEffect(() => {
+    cancelCapture();
+    Object.values(recordingsRef.current).forEach((r) => URL.revokeObjectURL(r.url));
+    recordingsRef.current = {};
+    setRecordings({});
+  }, [marks]);
+
+  // Nettoyage au démontage
+  useEffect(
+    () => () => {
+      stopCamera();
+      Object.values(recordingsRef.current).forEach((r) => URL.revokeObjectURL(r.url));
+    },
+    []
+  );
+
+  // Fenêtre flottante : position initiale sur le côté droit + branchement du flux caméra
+  useEffect(() => {
+    if (training && cameraOn && !isMobile) {
+      setPos({ x: Math.max(8, window.innerWidth - 340), y: 80 });
+    }
+  }, [training, cameraOn, isMobile]);
+
+  useEffect(() => {
+    const v = liveRef.current;
+    if (v && streamRef.current) {
+      v.srcObject = streamRef.current;
+      v.play().catch(() => {});
+    }
+  }, [training, cameraOn, isMobile]);
+
+  // Mode d'affichage de la caméra : Live (retour), Rec (capture en cours), Replay (relecture)
+  const hasRec = !!recordings[seg];
+  const mode: 'live' | 'rec' | 'replay' =
+    phase === 'armed' || phase === 'recording' ? 'rec' : hasRec && !viewLive ? 'replay' : 'live';
+  // Sur mobile, la capture alterne avec la vidéo YouTube au lieu d'avoir sa propre fenêtre
+  const replayVisible = isMobile ? hasRec && altShow && phase === 'idle' : mode === 'replay';
+  const replayUrl = recordings[seg]?.url;
+  const recCount = Object.keys(recordings).length;
+  const coverActive = training && isMobile && portrait && cover;
+
+  // La relecture redémarre à chaque tour de boucle pour rester synchronisée
+  useEffect(() => {
+    const r = replayRef.current;
+    if (!r || !replayVisible) return;
+    r.currentTime = 0;
+    r.play().catch(() => {});
+  }, [replayUrl, replayVisible, loopTick]);
 
   // Garde le segment actif visible dans la liste
   useEffect(() => {
@@ -328,6 +474,9 @@ export function LoopPlayer({
 
   function goTo(index: number) {
     const i = Math.max(0, Math.min(segCount - 1, index));
+    cancelCapture();
+    setViewLive(false);
+    setAltShow(false);
     setSeg(i);
     playerRef.current?.seekTo(points[i], true);
     playerRef.current?.playVideo();
@@ -336,11 +485,290 @@ export function LoopPlayer({
   function togglePlay() {
     const p = playerRef.current;
     if (!p) return;
+    if (phaseRef.current !== 'idle') cancelCapture();
     playing ? p.pauseVideo() : p.playVideo();
   }
 
+  // ---------- Caméra et captures ----------
+
+  function setPhase(p: Phase) {
+    phaseRef.current = p;
+    setPhaseState(p);
+  }
+
+  function addTimer(fn: () => void, ms: number) {
+    timersRef.current.push(window.setTimeout(fn, ms));
+  }
+
+  function clearTimers() {
+    timersRef.current.forEach((t) => clearTimeout(t));
+    timersRef.current = [];
+  }
+
+  async function startCamera() {
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
+      });
+      if (!trainingRef.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      streamRef.current = stream;
+      setCameraOn(true);
+    } catch {
+      // Refus ou pas de caméra : l'entraînement continue sans
+    }
+  }
+
+  function stopCamera() {
+    cancelCapture();
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    setCameraOn(false);
+  }
+
+  function storeRecording(segIndex: number, rec: Recording) {
+    const old = recordingsRef.current[segIndex];
+    if (old) URL.revokeObjectURL(old.url);
+    const next = { ...recordingsRef.current, [segIndex]: rec };
+    recordingsRef.current = next;
+    setRecordings(next);
+  }
+
+  // Annule compte à rebours / enregistrement en cours (l'ancienne capture est conservée)
+  function cancelCapture() {
+    clearTimers();
+    setCount(null);
+    const h = handleRef.current;
+    if (h) {
+      h.discard = true;
+      try {
+        if (h.rec.state !== 'inactive') h.rec.stop();
+      } catch {}
+      handleRef.current = null;
+    }
+    if (phaseRef.current !== 'idle') setPhase('idle');
+  }
+
+  // Retour au début du segment, pause, compte à rebours 3-2-1-Go, puis lecture + enregistrement
+  function beginCapture() {
+    const p = playerRef.current;
+    if (!streamRef.current || !trainingRef.current || !p) return;
+    cancelCapture();
+    recSegRef.current = seg;
+    p.seekTo(start, true);
+    p.pauseVideo();
+    setViewLive(true);
+    setAltShow(false);
+    setPhase('countdown');
+    setCount('3');
+    addTimer(() => setCount('2'), 1000);
+    addTimer(() => setCount('1'), 2000);
+    addTimer(goCapture, 3000);
+  }
+
+  function goCapture() {
+    setCount('Go !');
+    setPhase('armed');
+    playerRef.current?.playVideo();
+    addTimer(() => setCount(null), 800);
+    // Filet de sécurité si l'événement "lecture démarrée" n'arrive pas
+    addTimer(() => {
+      if (phaseRef.current === 'armed') startRecorder();
+    }, 2000);
+  }
+
+  function startRecorder() {
+    const stream = streamRef.current;
+    if (!stream || phaseRef.current !== 'armed') return;
+    const mime = pickMime();
+    const chunks: Blob[] = [];
+    let rec: MediaRecorder;
+    try {
+      rec = new MediaRecorder(
+        stream,
+        mime ? { mimeType: mime, videoBitsPerSecond: 2_500_000 } : undefined
+      );
+    } catch {
+      setPhase('idle');
+      return;
+    }
+    const handle = { rec, discard: false };
+    const segIndex = recSegRef.current;
+    const settings = stream.getVideoTracks()[0]?.getSettings();
+    rec.ondataavailable = (e) => {
+      if (e.data.size) chunks.push(e.data);
+    };
+    rec.onstop = () => {
+      if (handle.discard || !chunks.length) return;
+      const type = rec.mimeType || mime || 'video/webm';
+      const blob = new Blob(chunks, { type });
+      storeRecording(segIndex, {
+        blob,
+        url: URL.createObjectURL(blob),
+        mime: type,
+        w: settings?.width ?? 1280,
+        h: settings?.height ?? 720,
+      });
+    };
+    rec.start();
+    handleRef.current = handle;
+    setPhase('recording');
+  }
+
+  // Retour au début du segment (avec un délai de garde pour ne pas se déclencher plusieurs fois)
+  function triggerLoop(p: any) {
+    const t = performance.now();
+    if (t - lastLoopRef.current < 400) return;
+    lastLoopRef.current = t;
+    p.seekTo(bounds.current.start, true);
+    loopHook.current();
+  }
+
+  // Fin du segment atteinte pendant l'enregistrement : on arrête et on passe en relecture
+  function finishCapture() {
+    clearTimers();
+    const h = handleRef.current;
+    handleRef.current = null;
+    if (h) {
+      // On laisse tourner l'enregistreur un instant après la fin du segment
+      setTimeout(() => {
+        try {
+          if (h.rec.state !== 'inactive') h.rec.stop();
+        } catch {}
+      }, CAPTURE_TAIL_MS);
+    }
+    setPhase('idle');
+    setViewLive(false);
+    setAltShow(true);
+  }
+
+  function toggleCapture() {
+    if (phaseRef.current !== 'idle') cancelCapture();
+    else beginCapture();
+  }
+
+  async function exportVideo() {
+    const entries = Object.entries(recordingsRef.current)
+      .map(([k, v]) => ({ k: Number(k), v }))
+      .sort((a, b) => a.k - b.k);
+    if (!entries.length || exporting || typeof MediaRecorder === 'undefined') return;
+    const W = entries[0].v.w || 1280;
+    const H = entries[0].v.h || 720;
+    const mime = pickMime();
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = W;
+      canvas.height = H;
+      const ctx = canvas.getContext('2d')!;
+      const out = new MediaRecorder(
+        canvas.captureStream(30),
+        mime ? { mimeType: mime, videoBitsPerSecond: 3_000_000 } : undefined
+      );
+      const chunks: Blob[] = [];
+      out.ondataavailable = (e) => {
+        if (e.data.size) chunks.push(e.data);
+      };
+      const stopped = new Promise<void>((res) => {
+        out.onstop = () => res();
+      });
+      const video = document.createElement('video');
+      video.muted = true;
+      video.playsInline = true;
+      out.start();
+      // Les captures sont rejouées l'une après l'autre dans l'ordre des segments
+      for (let i = 0; i < entries.length; i++) {
+        setExporting({ i: i + 1, n: entries.length });
+        await new Promise<void>((resolve) => {
+          let raf = 0;
+          const finish = () => {
+            cancelAnimationFrame(raf);
+            resolve();
+          };
+          const draw = () => {
+            const vw = video.videoWidth;
+            const vh = video.videoHeight;
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, W, H);
+            if (vw && vh) {
+              const sc = Math.min(W / vw, H / vh);
+              ctx.drawImage(video, (W - vw * sc) / 2, (H - vh * sc) / 2, vw * sc, vh * sc);
+            }
+            raf = requestAnimationFrame(draw);
+          };
+          video.onended = finish;
+          video.onerror = finish;
+          video.src = entries[i].v.url;
+          video.play().then(draw).catch(finish);
+        });
+      }
+      out.stop();
+      await stopped;
+      const type = out.mimeType || mime || 'video/webm';
+      const url = URL.createObjectURL(new Blob(chunks, { type }));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `entrainement.${type.includes('mp4') ? 'mp4' : 'webm'}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } catch {
+      alert("L'export vidéo n'est pas pris en charge par ce navigateur.");
+    } finally {
+      setExporting(null);
+    }
+  }
+
+  // Fenêtre flottante : déplacement et redimensionnement au pointeur.
+  // setPointerCapture garantit que les mouvements sont suivis même si le curseur va très vite
+  // ou sort de la fenêtre, et que le relâchement du clic est toujours reçu.
+  function onFloatDown(e: React.PointerEvent<HTMLDivElement>) {
+    const r = e.currentTarget.getBoundingClientRect();
+    dragRef.current = { dx: e.clientX - r.left, dy: e.clientY - r.top };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }
+
+  function onFloatMove(e: React.PointerEvent<HTMLDivElement>) {
+    const d = dragRef.current;
+    if (!d) return;
+    setPos({
+      x: clamp(e.clientX - d.dx, 0, window.innerWidth - 80),
+      y: clamp(e.clientY - d.dy, 0, window.innerHeight - 60),
+    });
+  }
+
+  function endFloatDrag() {
+    dragRef.current = null;
+  }
+
+  function onResizeDown(e: React.PointerEvent<HTMLDivElement>) {
+    e.stopPropagation(); // ne démarre pas un déplacement
+    e.preventDefault();
+    resizeRef.current = { x: e.clientX, y: e.clientY, w: size.w, h: size.h };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }
+
+  function onResizeMove(e: React.PointerEvent<HTMLDivElement>) {
+    const r = resizeRef.current;
+    if (!r) return;
+    setSize({
+      w: clamp(r.w + e.clientX - r.x, 160, Math.max(160, window.innerWidth - pos.x)),
+      h: clamp(r.h + e.clientY - r.y, 100, Math.max(100, window.innerHeight - pos.y)),
+    });
+  }
+
+  function endResize() {
+    resizeRef.current = null;
+  }
+
   function enterTraining() {
+    trainingRef.current = true;
     setTraining(true);
+    startCamera();
     // Plein écran du navigateur (refusé si déclenché par la manette : le mode reste plein fenêtre)
     Promise.resolve(rootRef.current?.requestFullscreen?.()).catch(() => {});
   }
@@ -356,6 +784,9 @@ export function LoopPlayer({
     restart: () => goTo(seg),
     next: () => goTo(seg + 1),
     prev: () => goTo(seg - 1),
+    record: () => {
+      if (trainingRef.current && streamRef.current) toggleCapture();
+    },
     mark: () => {
       if (!readOnly && !training) addMark();
     },
@@ -366,6 +797,32 @@ export function LoopPlayer({
   };
 
   const editable = !readOnly && !training;
+
+  armedHook.current = startRecorder;
+  triggerLoopRef.current = triggerLoop;
+  loopHook.current = () => {
+    if (phaseRef.current === 'recording') finishCapture();
+    else if (phaseRef.current === 'idle' && isMobile && recordingsRef.current[seg]) {
+      setAltShow((a) => !a);
+    }
+    setLoopTick((t) => t + 1);
+  };
+
+  // Même élément <video> pour la relecture : dans la fenêtre flottante (desktop)
+  // ou par-dessus la vidéo YouTube (mobile)
+  const replayVideo = (
+    <video
+      ref={replayRef}
+      src={replayUrl}
+      muted
+      playsInline
+      className={
+        isMobile
+          ? `absolute inset-0 z-10 h-full w-full scale-x-[-1] object-cover ${replayVisible ? '' : 'hidden'}`
+          : `absolute inset-0 h-full w-full scale-x-[-1] object-cover ${replayVisible ? '' : 'invisible'}`
+      }
+    />
+  );
 
   const controls = (
     <div className="flex flex-wrap items-center gap-2">
@@ -404,6 +861,21 @@ export function LoopPlayer({
             Boucler
           </label>
         </>
+      )}
+      {training && cameraOn && (
+        <button onClick={toggleCapture} className={`${btnPrimary} min-w-[6.5rem]`}>
+          {phase === 'idle' ? 'Me filmer' : 'Annuler'}
+        </button>
+      )}
+      {recCount > 0 && (
+        <button onClick={exportVideo} disabled={!!exporting} className={`${btn} min-w-[8rem]`}>
+          {exporting ? `Export ${exporting.i}/${exporting.n}…` : `Exporter (${recCount})`}
+        </button>
+      )}
+      {training && isMobile && portrait && (
+        <button onClick={() => setCover((c) => !c)} className={btn}>
+          {cover ? 'Ajuster' : 'Remplir'}
+        </button>
       )}
       {training && (
         <button onClick={exitTraining} className={`${btn} ml-auto`}>
@@ -450,15 +922,45 @@ export function LoopPlayer({
             <div
               className={
                 training
-                  ? 'w-full shrink-0 bg-black'
+                  ? 'relative w-full shrink-0 overflow-hidden bg-black'
                   : 'mx-auto aspect-video overflow-hidden rounded-lg bg-black'
               }
               style={
                 training
-                  ? { height: `calc(100dvh - ${barH}px)` }
+                  ? ({
+                      height: `calc(100dvh - ${barH}px)`,
+                      containerType: coverActive ? 'size' : undefined,
+                    } as React.CSSProperties)
                   : { width: 'min(100%, calc(35vh * 16 / 9))' }
               }>
-              <div ref={holderRef} className="h-full w-full [&_iframe]:h-full [&_iframe]:w-full" />
+              {/* Mobile en portrait : la vidéo est agrandie pour remplir l'écran (bords rognés) */}
+              <div
+                ref={holderRef}
+                className={`[&_iframe]:h-full [&_iframe]:w-full ${coverActive ? '' : 'h-full w-full'}`}
+                style={
+                  coverActive
+                    ? {
+                        position: 'absolute',
+                        left: '50%',
+                        top: '50%',
+                        transform: 'translate(-50%, -50%)',
+                        width: 'max(100cqw, calc(100cqh * 16 / 9))',
+                        height: 'max(100cqh, calc(100cqw * 9 / 16))',
+                      }
+                    : undefined
+                }
+              />
+              {training && isMobile && replayVideo}
+              {training && isMobile && cameraOn && (mode === 'rec' || replayVisible) && (
+                <span className="absolute left-3 top-3 z-20 flex items-center gap-1.5 rounded-full bg-black/70 px-2.5 py-1 text-xs font-semibold text-white">
+                  <span
+                    className={`h-2 w-2 rounded-full ${
+                      mode === 'rec' ? 'animate-pulse bg-red-500' : 'bg-sky-400'
+                    }`}
+                  />
+                  {mode === 'rec' ? 'Rec' : 'Replay'}
+                </span>
+              )}
             </div>
 
             <div
@@ -526,6 +1028,10 @@ export function LoopPlayer({
                     <b>RB</b> ou croix droite : segment suivant
                   </li>
                   <li>
+                    <b>B</b> (bouton de droite) : en mode entraînement avec caméra, se filmer sur le
+                    segment en cours (ou annuler la capture)
+                  </li>
+                  <li>
                     <b>Start</b> : entrer dans le mode entraînement ou en sortir
                   </li>
                   {!readOnly && (
@@ -535,8 +1041,8 @@ export function LoopPlayer({
                   )}
                 </ul>
                 <p className="text-muted-foreground">
-                  Noms de la manette Xbox. Sur une manette PlayStation : A = croix, X = carré, Y =
-                  triangle, LB / RB = L1 / R1, Start = Options.
+                  Noms de la manette Xbox. Sur une manette PlayStation : A = croix, B = rond, X =
+                  carré, Y = triangle, LB / RB = L1 / R1, Start = Options.
                 </p>
               </div>
             </details>
@@ -567,6 +1073,9 @@ export function LoopPlayer({
                           {playing ? 'En cours de lecture' : 'Segment courant'}
                         </span>
                       )}
+                      {recordings[k] && (
+                        <span className="rounded bg-muted px-1.5 py-0.5 text-xs">Filmé</span>
+                      )}
                     </button>
 
                     <Edge
@@ -594,6 +1103,79 @@ export function LoopPlayer({
             </ol>
           )}
         </>
+      )}
+
+      {/* Compte à rebours au centre de l'écran */}
+      {training && count && (
+        <div className="pointer-events-none fixed inset-0 z-40 flex items-center justify-center">
+          <span
+            key={count}
+            className="select-none text-8xl font-black leading-none text-white drop-shadow-[0_4px_24px_rgba(0,0,0,0.85)] sm:text-[10rem]">
+            {count}
+          </span>
+        </div>
+      )}
+
+      {/* Fenêtre flottante du retour caméra (desktop) : déplaçable, redimensionnable */}
+      {training && cameraOn && !isMobile && (
+        <div
+          ref={floatRef}
+          onPointerDown={onFloatDown}
+          onPointerMove={onFloatMove}
+          onPointerUp={endFloatDrag}
+          onPointerCancel={endFloatDrag}
+          onLostPointerCapture={endFloatDrag}
+          style={{ left: pos.x, top: pos.y, width: size.w, height: size.h }}
+          className="fixed z-30 cursor-move touch-none select-none overflow-hidden rounded-lg border-2 border-white/70 bg-black shadow-2xl">
+          <video
+            ref={liveRef}
+            muted
+            playsInline
+            autoPlay
+            className={`absolute inset-0 h-full w-full scale-x-[-1] object-cover ${
+              mode === 'replay' ? 'invisible' : ''
+            }`}
+          />
+          {replayVideo}
+          <button
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={() => hasRec && phase === 'idle' && setViewLive((v) => !v)}
+            title={hasRec ? 'Basculer entre le direct et la capture' : undefined}
+            className="absolute left-2 top-2 flex items-center gap-1.5 rounded-full bg-black/70 px-2.5 py-1 text-xs font-semibold text-white">
+            <span
+              className={`h-2 w-2 rounded-full ${
+                mode === 'rec'
+                  ? 'animate-pulse bg-red-500'
+                  : mode === 'replay'
+                    ? 'bg-sky-400'
+                    : 'bg-green-500'
+              }`}
+            />
+            {mode === 'rec' ? 'Rec' : mode === 'replay' ? 'Replay' : 'Live'}
+          </button>
+          {/* Poignée de redimensionnement */}
+          <div
+            onPointerDown={onResizeDown}
+            onPointerMove={onResizeMove}
+            onPointerUp={endResize}
+            onPointerCancel={endResize}
+            onLostPointerCapture={endResize}
+            className="absolute bottom-0 right-0 z-10 flex h-7 w-7 cursor-nwse-resize touch-none items-end justify-end p-1"
+            title="Redimensionner">
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 14 14"
+              className="drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)]">
+              <path
+                d="M13 3 3 13M13 8 8 13"
+                stroke="white"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+              />
+            </svg>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -1,49 +1,19 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { LoopPlayer } from '@/components/loop-player';
 import { GoogleButton } from '@/components/google-button';
+import { clearDraft, readDraft, writeDraft } from '@/lib/loop-draft';
 
-const DRAFT_KEY = 'loop-draft-v1';
 const field = 'w-full rounded-md border bg-background px-3 py-2 text-sm';
-
-type Draft = {
-  videoId: string | null;
-  marks: number[];
-  title: string;
-  description: string;
-  author: string;
-};
-
-function readDraft(): Partial<Draft> | null {
-  try {
-    const raw = localStorage.getItem(DRAFT_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
-}
-
-function writeDraft(d: Draft) {
-  try {
-    if (!d.videoId) localStorage.removeItem(DRAFT_KEY);
-    else localStorage.setItem(DRAFT_KEY, JSON.stringify(d));
-  } catch {
-    // stockage indisponible (navigation privée, quota…) : on ignore
-  }
-}
-
-function clearDraft() {
-  try {
-    localStorage.removeItem(DRAFT_KEY);
-  } catch {}
-}
 
 export function LoopEditor() {
   const router = useRouter();
   const [user, setUser] = useState<any>(null);
+  const [username, setUsername] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
   const [playerKey, setPlayerKey] = useState(0);
   const [initial, setInitial] = useState<{ videoId: string | null; marks: number[] }>({
@@ -56,24 +26,33 @@ export function LoopEditor() {
   });
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
-  const [author, setAuthor] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const published = useRef(false);
 
-  // Chargement du brouillon + de l'utilisateur
+  // Chargement du brouillon, de l'utilisateur et de son nom d'utilisateur
   useEffect(() => {
     (async () => {
       const saved = readDraft();
       let u: any = null;
+      let name: string | null = null;
       try {
-        u = (await createClient().auth.getUser()).data.user;
+        const supabase = createClient();
+        u = (await supabase.auth.getUser()).data.user;
+        if (u) {
+          const { data } = await supabase
+            .from('profiles')
+            .select('username')
+            .eq('id', u.id)
+            .maybeSingle();
+          name = data?.username ?? null;
+        }
       } catch {}
       setUser(u);
+      setUsername(name);
       setInitial({ videoId: saved?.videoId ?? null, marks: saved?.marks ?? [] });
       setTitle(saved?.title ?? '');
       setDescription(saved?.description ?? '');
-      setAuthor(saved?.author || u?.user_metadata?.full_name || '');
       setReady(true);
     })();
   }, []);
@@ -81,8 +60,8 @@ export function LoopEditor() {
   // Sauvegarde automatique du brouillon
   useEffect(() => {
     if (!ready || published.current) return;
-    writeDraft({ ...player, title, description, author });
-  }, [ready, player, title, description, author]);
+    writeDraft({ ...player, title, description });
+  }, [ready, player, title, description]);
 
   function discardDraft() {
     if (!confirm('Supprimer le brouillon en cours ?')) return;
@@ -103,6 +82,15 @@ export function LoopEditor() {
       setError('Le titre est obligatoire.');
       return;
     }
+    if (!user) {
+      setError('Connecte-toi pour publier.');
+      return;
+    }
+    if (!username) {
+      // Le brouillon est déjà sauvegardé localement : on le retrouvera au retour
+      router.push('/onboarding?next=/');
+      return;
+    }
     setBusy(true);
     setError('');
     const { data, error } = await createClient()
@@ -111,7 +99,6 @@ export function LoopEditor() {
         video_id: player.videoId,
         title: title.trim(),
         description: description.trim(),
-        author_name: author.trim() || 'Anonyme',
         marks: player.marks,
       })
       .select('id')
@@ -176,13 +163,18 @@ export function LoopEditor() {
             value={description}
             onChange={(e) => setDescription(e.target.value)}
           />
-          <input
-            className={field}
-            placeholder="Nom d'auteur"
-            maxLength={80}
-            value={author}
-            onChange={(e) => setAuthor(e.target.value)}
-          />
+          {user && username && (
+            <p className="text-sm text-muted-foreground">Publié sous le nom @{username}</p>
+          )}
+          {user && !username && (
+            <p className="text-sm text-muted-foreground">
+              Il te manque un nom d'utilisateur pour publier :{' '}
+              <Link href="/onboarding?next=/" className="underline underline-offset-2">
+                le choisir maintenant
+              </Link>{' '}
+              (ton brouillon sera conservé).
+            </p>
+          )}
           {error && <p className="text-sm text-destructive">{error}</p>}
           <button
             onClick={publish}
