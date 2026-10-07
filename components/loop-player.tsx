@@ -76,7 +76,7 @@ function pickMime(): string | undefined {
 
 // Temps de capture conservé après la fin du segment : le danseur a un temps de réaction,
 // son dernier mouvement se termine après la dernière image de la vidéo.
-const CAPTURE_TAIL_MS = 0;
+const CAPTURE_TAIL_MS = 300;
 
 // Vitesse du ralenti : YouTube n'accepte que des paliers fixes (0,25 / 0,5 / 0,75 / 1…),
 // 0,25 est le plus proche de ×0,3
