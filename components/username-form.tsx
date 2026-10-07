@@ -31,6 +31,12 @@ export function UsernameForm({ suggestion, next }: { suggestion: string; next: s
     const { error } = await supabase.from('profiles').insert({ id: user.id, username: name });
     setBusy(false);
     if (error) {
+      // Ce compte a déjà un profil (autre onglet, double clic…) : rien à faire, on continue
+      if (error.code === '23505' && error.message.includes('profiles_pkey')) {
+        router.push(next);
+        router.refresh();
+        return;
+      }
       setError(error.code === '23505' ? 'Ce nom est déjà pris.' : error.message);
       return;
     }

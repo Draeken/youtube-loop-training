@@ -17,12 +17,13 @@ export async function GET(request: Request) {
         data: { user },
       } = await supabase.auth.getUser();
       if (user) {
-        const { data: profile } = await supabase
+        const { data: profile, error: profileError } = await supabase
           .from('profiles')
           .select('id')
           .eq('id', user.id)
           .maybeSingle();
-        if (!profile) {
+        // Pas de profil *et* pas d'erreur de lecture : seulement dans ce cas on demande un nom
+        if (!profile && !profileError) {
           return NextResponse.redirect(`${origin}/onboarding?next=${encodeURIComponent(safeNext)}`);
         }
       }
