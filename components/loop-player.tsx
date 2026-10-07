@@ -78,6 +78,10 @@ function pickMime(): string | undefined {
 // son dernier mouvement se termine après la dernière image de la vidéo.
 const CAPTURE_TAIL_MS = 0;
 
+// Vitesse du ralenti : YouTube n'accepte que des paliers fixes (0,25 / 0,5 / 0,75 / 1…),
+// 0,25 est le plus proche de ×0,3
+const SLOW_RATE = 0.25;
+
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
 // Une borne de segment (début ou fin), avec ses boutons ±0,5 s si elle est modifiable
@@ -160,6 +164,7 @@ export function LoopPlayer({
   const [cover, setCover] = useState(true);
   const [pos, setPos] = useState({ x: 0, y: 80 });
   const [size, setSize] = useState({ w: 320, h: 200 });
+  const [slow, setSlow] = useState(false);
 
   const rootRef = useRef<HTMLDivElement>(null);
   const holderRef = useRef<HTMLDivElement>(null);
@@ -181,6 +186,8 @@ export function LoopPlayer({
   const dragRef = useRef<{ dx: number; dy: number } | null>(null);
   const resizeRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
   const lastLoopRef = useRef(0);
+  const slowPtr = useRef(false); // bouton maintenu à la souris / au doigt
+  const slowPad = useRef(false); // gâchette maintenue sur la manette
   const triggerLoopRef = useRef<(p: any) => void>(() => {});
   const trainingRef = useRef(false);
   const loopHook = useRef<() => void>(() => {});
@@ -216,7 +223,7 @@ export function LoopPlayer({
         videoId,
         width: '100%',
         height: '100%',
-        playerVars: { rel: 0, playsinline: 1 },
+        playerVars: { rel: 0, playsinline: 1, iv_load_policy: 3 },
         events: {
           onReady: (e: any) => setDuration(e.target.getDuration() || 0),
           onStateChange: (e: any) => {
@@ -274,6 +281,16 @@ export function LoopPlayer({
     return () => clearInterval(id);
   }, []);
 
+  // Si la fenêtre perd le focus pendant que le bouton ralenti est maintenu, on revient à la normale
+  useEffect(() => {
+    const release = () => {
+      slowPtr.current = false;
+      updateSlow();
+    };
+    window.addEventListener('blur', release);
+    return () => window.removeEventListener('blur', release);
+  }, []);
+
   // Manette : détection des appuis sur les boutons
   useEffect(() => {
     const prev: Record<number, boolean[]> = {};
@@ -281,6 +298,12 @@ export function LoopPlayer({
       const pads = Array.from(navigator.getGamepads?.() ?? []).filter(Boolean) as Gamepad[];
       setPadName(pads[0]?.id ?? null);
       setPadStandard(pads[0] ? pads[0].mapping === 'standard' : true);
+      // Gâchettes LT / RT maintenues = ralenti
+      const padHeld = pads.some((gp) => gp.buttons[6]?.pressed || gp.buttons[7]?.pressed);
+      if (padHeld !== slowPad.current) {
+        slowPad.current = padHeld;
+        updateSlow();
+      }
       for (const gp of pads) {
         const last = prev[gp.index] ?? [];
         gp.buttons.forEach((b, i) => {
@@ -482,6 +505,26 @@ export function LoopPlayer({
     playerRef.current?.playVideo();
   }
 
+  // Ralenti tant que le bouton (ou une gâchette) est maintenu ; vitesse normale au relâchement
+  function updateSlow() {
+    const capturing = phaseRef.current === 'armed' || phaseRef.current === 'recording';
+    const on = (slowPtr.current || slowPad.current) && !capturing;
+    setSlow(on);
+    playerRef.current?.setPlaybackRate?.(on ? SLOW_RATE : 1);
+  }
+
+  function holdSlow(e: React.PointerEvent<HTMLButtonElement>) {
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId); // le relâchement est reçu même hors du bouton
+    slowPtr.current = true;
+    updateSlow();
+  }
+
+  function releaseSlow() {
+    slowPtr.current = false;
+    updateSlow();
+  }
+
   function togglePlay() {
     const p = playerRef.current;
     if (!p) return;
@@ -494,6 +537,7 @@ export function LoopPlayer({
   function setPhase(p: Phase) {
     phaseRef.current = p;
     setPhaseState(p);
+    updateSlow(); // pas de ralenti pendant une capture
   }
 
   function addTimer(fn: () => void, ms: number) {
@@ -829,6 +873,17 @@ export function LoopPlayer({
       <button onClick={togglePlay} className={`${btn} min-w-[5.5rem]`}>
         {playing ? 'Pause' : 'Lecture'}
       </button>
+      <button
+        onPointerDown={holdSlow}
+        onPointerUp={releaseSlow}
+        onPointerCancel={releaseSlow}
+        onLostPointerCapture={releaseSlow}
+        onContextMenu={(e) => e.preventDefault()}
+        disabled={phase === 'armed' || phase === 'recording'}
+        title="Maintiens pour ralentir la vidéo, relâche pour revenir à la vitesse normale"
+        className={`${slow ? btnPrimary : btn} min-w-[7.5rem] touch-none select-none whitespace-nowrap`}>
+        Ralenti ×0,25
+      </button>
       {editable && (
         <button onClick={addMark} className={`${btnPrimary} whitespace-nowrap`}>
           Poser un timecode{' '}
@@ -1022,6 +1077,9 @@ export function LoopPlayer({
                     <b>X</b> (bouton de gauche) : relancer le segment
                   </li>
                   <li>
+                    <b>LT</b> ou <b>RT</b> (gâchettes) : maintenir pour ralentir la vidéo
+                  </li>
+                  <li>
                     <b>LB</b> ou croix gauche : segment précédent
                   </li>
                   <li>
@@ -1042,7 +1100,7 @@ export function LoopPlayer({
                 </ul>
                 <p className="text-muted-foreground">
                   Noms de la manette Xbox. Sur une manette PlayStation : A = croix, B = rond, X =
-                  carré, Y = triangle, LB / RB = L1 / R1, Start = Options.
+                  carré, Y = triangle, LB / RB = L1 / R1, LT / RT = L2 / R2, Start = Options.
                 </p>
               </div>
             </details>
