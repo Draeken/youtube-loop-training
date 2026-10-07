@@ -690,6 +690,14 @@ export function LoopPlayer({
     setAltShow(true);
   }
 
+  // Bascule entre le direct et la capture du segment (desktop),
+  // ou entre la vidéo YouTube et la capture (mobile)
+  function toggleView() {
+    if (!streamRef.current || !recordings[seg] || phaseRef.current !== 'idle') return;
+    if (isMobile) setAltShow((a) => !a);
+    else setViewLive((v) => !v);
+  }
+
   function toggleCapture() {
     if (phaseRef.current !== 'idle') cancelCapture();
     else beginCapture();
@@ -832,7 +840,8 @@ export function LoopPlayer({
       if (trainingRef.current && streamRef.current) toggleCapture();
     },
     mark: () => {
-      if (!readOnly && !training) addMark();
+      if (trainingRef.current) toggleView();
+      else if (!readOnly) addMark();
     },
     training: () => {
       if (training) exitTraining();
@@ -922,6 +931,17 @@ export function LoopPlayer({
           {phase === 'idle' ? 'Me filmer' : 'Annuler'}
         </button>
       )}
+      {training && cameraOn && hasRec && phase === 'idle' && (
+        <button onClick={toggleView} className={`${btn} min-w-[8.5rem] whitespace-nowrap`}>
+          {isMobile
+            ? replayVisible
+              ? 'Voir la vidéo'
+              : 'Voir ma capture'
+            : mode === 'replay'
+              ? 'Voir le direct'
+              : 'Voir la capture'}
+        </button>
+      )}
       {recCount > 0 && (
         <button onClick={exportVideo} disabled={!!exporting} className={`${btn} min-w-[8rem]`}>
           {exporting ? `Export ${exporting.i}/${exporting.n}…` : `Exporter (${recCount})`}
@@ -978,7 +998,7 @@ export function LoopPlayer({
               className={
                 training
                   ? 'relative w-full shrink-0 overflow-hidden bg-black'
-                  : 'mx-auto aspect-video overflow-hidden rounded-lg bg-black'
+                  : 'relative mx-auto aspect-video overflow-hidden rounded-lg bg-black'
               }
               style={
                 training
@@ -1092,11 +1112,10 @@ export function LoopPlayer({
                   <li>
                     <b>Start</b> : entrer dans le mode entraînement ou en sortir
                   </li>
-                  {!readOnly && (
-                    <li>
-                      <b>Y</b> (bouton du haut) : poser un timecode
-                    </li>
-                  )}
+                  <li>
+                    <b>Y</b> (bouton du haut) : en entraînement avec caméra, basculer entre le
+                    direct et la capture{!readOnly && ' ; en édition, poser un timecode'}
+                  </li>
                 </ul>
                 <p className="text-muted-foreground">
                   Noms de la manette Xbox. Sur une manette PlayStation : A = croix, B = rond, X =
